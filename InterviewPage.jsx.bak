@@ -1,0 +1,419 @@
+// client/src/pages/InterviewPage.jsx
+import React, { useState, useEffect, useRef } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import SpeechRecognition, { useSpeechRecognition } from "react-speech-recognition";
+import "../App.css";
+
+const TECH_KEYWORDS = {
+  "artificial intelligence": ["machine learning", "ai", "neural network", "nlp", "dataset", "python", "training", "model"],
+  "data science": ["regression", "clustering", "pandas", "feature", "visualization", "statistics", "random forest"],
+  "cloud computing": ["aws", "azure", "docker", "kubernetes", "cloud", "linux"],
+  "cyber security": ["encryption", "firewall", "network", "hacking", "security", "threat"],
+  "iot": ["arduino", "raspberry pi", "mqtt", "sensors", "embedded c"],
+  "mobile app development": ["flutter", "react native", "android", "ios", "firebase", "api", "apk"]
+};
+
+const InterviewPage = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // Normalize domain names to match questions.json keys
+const rawDomain = (location.state?.domain || "artificial intelligence").toLowerCase().trim();
+
+const DOMAIN_MAP = {
+  "ai": "artificial intelligence",
+  "artificial intelligence": "artificial intelligence",
+  "data science": "data science",
+  "datascience": "data science",
+  "cloud": "cloud computing",
+  "cloud computing": "cloud computing",
+  "cloud-computing": "cloud computing",
+  "cyber": "cyber security",
+  "cyber security": "cyber security",
+  "cybersecurity": "cyber security",
+  "iot": "iot",
+  "i.o.t": "iot",
+  "internet of things": "iot",
+  "mobile": "mobile app development",
+  "mobile development": "mobile app development",
+  "mobile app development": "mobile app development"
+};
+
+const domain = DOMAIN_MAP[rawDomain] || "artificial intelligence";
+
+  const interviewType = location.state?.type || "Technical Interview";
+
+  const isHR = interviewType.toLowerCase().includes("hr");
+
+  const [questions, setQuestions] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [responses, setResponses] = useState([]);
+  const [answer, setAnswer] = useState("");
+  const [finished, setFinished] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [listening, setListening] = useState(false);
+
+  const [currentEmotion, setCurrentEmotion] = useState("neutral");
+
+  const videoRef = useRef(null);
+  const { transcript, resetTranscript } = useSpeechRecognition();
+
+  const speechStartRef = useRef(null);
+  const speechEndRef = useRef(null);
+
+  // Emotion capture
+  useEffect(() => {
+    const captureEmotion = async () => {
+      if (!videoRef.current || !videoRef.current.videoWidth) return;
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+
+      const imageData = canvas.toDataURL("image/jpeg");
+      try {
+        const res = await fetch("http://127.0.0.1:5000/analyze_emotion", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: imageData }),
+        });
+        const data = await res.json();
+        if (data && data.dominant_emotion) setCurrentEmotion(data.dominant_emotion);
+      } catch (err) {
+        // ignore repeated errors
+        // console.warn("Emotion detection failed:", err);
+      }
+    };
+
+    const interval = setInterval(captureEmotion, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Fetch questions
+  useEffect(() => {
+    const fetchQuestions = async () => {
+      try {
+        const key = isHR ? "HR Interview" : "Technical Interview";
+        const res = await fetch("http://127.0.0.1:5000/get_questions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ domain, interview_type: key }),
+        });
+        const data = await res.json();
+        if (data && Array.isArray(data.questions)) setQuestions(data.questions);
+        else setQuestions(["No questions found"]);
+      } catch (err) {
+        setQuestions(["Error loading questions"]);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchQuestions();
+  }, [domain, interviewType, isHR]);
+
+  // Start camera (video-first)
+  useEffect(() => {
+    const startCamera = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (videoRef.current) videoRef.current.srcObject = stream;
+        navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => {});
+      } catch (err) {
+        console.warn("Camera not accessible:", err);
+      }
+    };
+    startCamera();
+    return () => {
+      if (videoRef.current?.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
+
+  // Speech controls
+  const startSpeech = () => {
+    resetTranscript();
+    speechStartRef.current = Date.now();
+    SpeechRecognition.startListening({ continuous: true });
+    setListening(true);
+  };
+
+  const stopSpeech = async () => {
+    SpeechRecognition.stopListening();
+    speechEndRef.current = Date.now();
+    setListening(false);
+
+    const transcriptText = transcript.trim();
+    const durationSec = speechStartRef.current && speechEndRef.current ? (speechEndRef.current - speechStartRef.current) / 1000.0 : 0.0;
+    const wordCount = transcriptText.length > 0 ? transcriptText.split(/\s+/).length : 0;
+
+    if (isHR) {
+      if (!transcriptText) {
+        setResponses((prev) => [
+          ...prev,
+          { question: questions[currentIndex], answer: "", sentiment: "negative", sentiment_score: 0.05, score: 0 }
+        ]);
+        return;
+      }
+
+      try {
+        const res = await fetch("http://127.0.0.1:5000/score_hr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: transcriptText,
+            question: questions[currentIndex],
+            interview_type: "HR",
+            duration: durationSec,
+            words: wordCount
+          })
+        });
+        const data = await res.json();
+        if (data && !data.error) {
+          setResponses((prev) => [
+            ...prev,
+            {
+              question: questions[currentIndex],
+              answer: transcriptText,
+              sentiment: data.sentiment_class || "neutral",
+              sentiment_score: typeof data.sentiment_score === "number" ? data.sentiment_score : 0.5,
+              bert_score: data.bert_score ?? 0,
+              voice_metrics: data.voice_metrics || {},
+              score: typeof data.score === "number" ? data.score : 0
+            }
+          ]);
+        } else {
+          const fallbackScore = Math.min(5, Math.max(0, Math.round((Math.min(10, wordCount) / 10) * 5)));
+          setResponses((prev) => [
+            ...prev,
+            {
+              question: questions[currentIndex],
+              answer: transcriptText,
+              sentiment: "neutral",
+              sentiment_score: 0.5,
+              score: fallbackScore
+            }
+          ]);
+        }
+      } catch (err) {
+        const fallbackScore = Math.min(5, Math.max(0, Math.round((Math.min(10, wordCount) / 10) * 5)));
+        setResponses((prev) => [
+          ...prev,
+          {
+            question: questions[currentIndex],
+            answer: transcriptText,
+            sentiment: "neutral",
+            sentiment_score: 0.5,
+            score: fallbackScore
+          }
+        ]);
+      }
+      return;
+    }
+
+    // If user used speech for technical question accidentally
+    setResponses((prev) => [
+      ...prev,
+      { question: questions[currentIndex], answer: transcriptText, sentiment: "Not Applicable", sentiment_score: 0, score: 0 }
+    ]);
+  };
+
+  // Next
+  const handleNext = async () => {
+    if (isHR) {
+      const respForCurrent = responses[currentIndex];
+      if (!respForCurrent || respForCurrent.question !== questions[currentIndex]) {
+        setResponses((prev) => [
+          ...prev,
+          { question: questions[currentIndex], answer: "", sentiment: "negative", sentiment_score: 0.05, score: 0 }
+        ]);
+      }
+      resetTranscript();
+    } else {
+      const userAnswer = answer.trim();
+
+      if (userAnswer.length === 0) {
+        setResponses((prev) => [
+          ...prev,
+          {
+            question: questions[currentIndex],
+            answer: "",
+            sentiment: "Not Applicable",
+            sentiment_score: 0,
+            score: 0
+          }
+        ]);
+      } else {
+        const keywords = TECH_KEYWORDS[domain] || [];
+        try {
+          const res = await fetch("http://127.0.0.1:5000/score_technical", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              answer: userAnswer,
+              question: questions[currentIndex],
+              keywords: keywords
+            })
+          });
+          const data = await res.json();
+          const finalScore = data && typeof data.final_score === "number" ? data.final_score : 0;
+          setResponses((prev) => [
+            ...prev,
+            {
+              question: questions[currentIndex],
+              answer: userAnswer,
+              sentiment: "Not Applicable",
+              sentiment_score: 0,
+              score: finalScore,
+              keyword_score: data.keyword_score ?? null,
+              bert_score: data.bert_score ?? null
+            }
+          ]);
+        } catch (err) {
+          const keywordsLower = (TECH_KEYWORDS[domain] || []).map(k => k.toLowerCase());
+          const matchCount = keywordsLower.filter((kw) => userAnswer.toLowerCase().includes(kw)).length;
+          let fallbackScore = 0;
+          if (matchCount >= 3) fallbackScore = 5;
+          else if (matchCount === 2) fallbackScore = 4;
+          else if (matchCount === 1) fallbackScore = 3;
+          else fallbackScore = 0;
+          setResponses((prev) => [
+            ...prev,
+            {
+              question: questions[currentIndex],
+              answer: userAnswer,
+              sentiment: "Not Applicable",
+              sentiment_score: 0,
+              score: fallbackScore
+            }
+          ]);
+        }
+      }
+      setAnswer("");
+    }
+
+    if (currentIndex + 1 < questions.length) {
+      setCurrentIndex((i) => i + 1);
+    } else {
+      setFinished(true);
+    }
+  };
+
+  // Results
+  const handleResult = () => {
+    const totalPossible = questions.length * 5;
+    const totalScore = responses.reduce((sum, r) => sum + (r.score || 0), 0);
+    const interviewScore = totalPossible > 0 ? Math.round((totalScore / totalPossible) * 100) : 0;
+    const savedAtsScore = parseFloat(localStorage.getItem("ats_score")) || 0;
+
+    if (isHR) {
+      const sentimentScores = responses.filter((r) => typeof r.sentiment_score === "number").map((r) => r.sentiment_score);
+      const avgSentiment = sentimentScores.length > 0 ? sentimentScores.reduce((a, b) => a + b, 0) / sentimentScores.length : 0.5;
+      navigate("/result", { state: { interviewScore, atsScore: savedAtsScore, avgSentiment } });
+      return;
+    }
+
+    navigate("/result", { state: { interviewScore, atsScore: savedAtsScore, avgSentiment: "Not Applicable" } });
+  };
+
+  if (loading) return <div className="ip-loading">Loading questions...</div>;
+
+  const currentQuestion = questions[currentIndex];
+
+  return (
+    <div className="interview-page">
+      <div className="interview-content">
+        <div className="interview-left">
+          <div className="interview-header">
+            <div>
+              <h2 className="ip-domain">{domain}</h2>
+              <h3 className="ip-type">{interviewType}</h3>
+            </div>
+            <div className="ip-progress">Q {currentIndex + 1} / {questions.length}</div>
+          </div>
+
+          <div className="question-card">
+            <p className="question-text">{currentQuestion}</p>
+
+            {isHR ? (
+              <>
+                <p className={`speech-status ${listening ? "live" : ""}`}>
+                  {listening ? "🎤 Listening..." : "🎤 Mic ready"}
+                </p>
+
+                <div className="mic-controls">
+                  <button onClick={startSpeech} className="mic-btn mic-start">Start Speaking</button>
+                  <button onClick={stopSpeech} className="mic-btn mic-stop">Stop</button>
+                </div>
+
+                <div className="transcript-box">
+                  <label className="transcript-label">Your Answer</label>
+                  <div className="transcript-text">{transcript || "No speech detected yet."}</div>
+                </div>
+              </>
+            ) : (
+              <>
+                <label className="answer-label">Type your answer below</label>
+                <textarea
+                  className="answer-input"
+                  rows="6"
+                  value={answer}
+                  onChange={(e) => setAnswer(e.target.value)}
+                  placeholder="Type your answer..."
+                />
+              </>
+            )}
+
+            <div className="question-actions">
+              <button onClick={handleNext} className="ip-next-btn">
+                {currentIndex + 1 === questions.length ? "Finish Interview" : "Next Question"}
+              </button>
+            </div>
+          </div>
+
+          {finished && (
+            <div className="summary-card">
+              <h3>Interview Summary</h3>
+              <ul>
+                {responses.map((r, i) => (
+                  <li key={i}>
+                    <strong>Q{i + 1}:</strong> {r.question} <br />
+                    <em>Answer:</em> {r.answer || "Skipped"}{" "}
+                    {isHR && r.sentiment && (
+                      <span>
+                        — Sentiment:{" "}
+                        {r.sentiment === "positive" ? "😊 Positive" : r.sentiment === "neutral" ? "😐 Neutral" : "☹️ Negative"}
+                      </span>
+                    )}
+                    {r.score !== undefined && <span> — Score: {r.score}/5</span>}
+                  </li>
+                ))}
+              </ul>
+
+              <button onClick={handleResult} className="ip-result-btn">View Result</button>
+            </div>
+          )}
+        </div>
+
+        <div className="interview-right">
+          <div className="camera-card">
+            <video ref={videoRef} autoPlay muted playsInline className="camera-video" />
+            <div className="camera-caption">
+              <div className={`camera-status ${listening ? "listening" : ""}`} />
+              <div>
+                <div className="cam-title">Live Camera</div>
+                <div className="cam-sub">Sentiment Analysis {isHR ? "● Enabled" : "● Keyword Mode"}</div>
+                <div className="emotion-detect">🎭 Emotion: <strong>{currentEmotion}</strong></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+};
+
+export default InterviewPage;
